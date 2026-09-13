@@ -1,0 +1,72 @@
+﻿@page
+@model IndexModel
+@{
+    ViewData["Title"] = "EstudaBot";
+}
+
+<main class="chat-shell">
+    <header class="hero">
+        <div class="brand-mark">E</div>
+        <div>
+            <p class="eyebrow">ASSISTENTE DE ESTUDOS</p>
+            <h1>EstudaBot</h1>
+            <p class="subtitle">Aprenda melhor, uma pergunta por vez.</p>
+        </div>
+        <form method="post" asp-page-handler="NewChat" class="new-chat-form">
+            <button type="submit" title="Começar uma nova conversa">Nova conversa</button>
+        </form>
+        <span class="status"><i></i> modelo online</span>
+    </header>
+
+    <section class="chat-panel" aria-label="Conversa com o EstudaBot">
+        <div class="messages" id="messages">
+            @foreach (var message in Model.Messages)
+            {
+                <article class="message @message.Role">
+                    <div class="avatar">@(message.Role == "assistant" ? "E" : "Você")</div>
+                    <div class="bubble">
+                        <p>@message.Text</p>
+                        @if (message.Intent is not null)
+                        {
+                            <small>intenção: @message.Intent · confiança: @message.Confidence?.ToString("P0")</small>
+                        }
+                        @if (message.Sources is not null)
+                        {
+                            <div class="sources">
+                                @foreach (var source in message.Sources)
+                                {
+                                    <a class="source-link" href="@source.Url" target="_blank" rel="noreferrer">@source.Provider: @source.Title</a>
+                                }
+                            </div>
+                        }
+                        @if (message.InteractionId is not null)
+                        {
+                            <form method="post" asp-page-handler="Feedback" class="feedback-form">
+                                <input type="hidden" name="id" value="@message.InteractionId" />
+                                <span>Essa resposta ajudou?</span>
+                                <button type="submit" name="correct" value="true" title="Marcar resposta como correta">Sim</button>
+                                <button type="submit" name="correct" value="false" title="Marcar resposta como incorreta">Não</button>
+                            </form>
+                        }
+                    </div>
+                </article>
+            }
+        </div>
+
+        <form method="post" asp-page-handler="Send" class="composer">
+            <label for="Message">Sua pergunta</label>
+            <div class="input-row">
+                <input id="Message" asp-for="Message" autocomplete="off" placeholder="Ex.: como criar um plano de estudos?" />
+                <button type="submit" title="Enviar pergunta" aria-label="Enviar pergunta">&rarr;</button>
+            </div>
+            <p class="hint">O classificador ML.NET identifica a intenção da sua mensagem.</p>
+        </form>
+    </section>
+</div>
+
+<script>
+    const messages = document.getElementById('messages');
+    if (messages) {
+        requestAnimationFrame(() => messages.scrollTop = messages.scrollHeight);
+    }
+</script>
