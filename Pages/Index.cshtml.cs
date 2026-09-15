@@ -14,7 +14,8 @@ public class IndexModel : PageModel
 {
     private const string ChatSessionKey = "estudabot.chat";
     private const string ChatSessionVersionKey = "estudabot.chat.version";
-    private const string ChatSessionVersion = "3";
+    private const string ChatSessionVersion = "4";
+    private const int MaxSessionMessages = 40;
     private static readonly HashSet<string> StopWords =
     ["a", "as", "o", "os", "e", "de", "da", "do", "das", "dos", "em", "no", "na", "nos", "nas", "um", "uma", "uns", "umas", "que", "é", "para", "por", "como", "funciona", "funcionar", "explique", "explicar", "qual", "quem", "foi"];
 
@@ -41,33 +42,43 @@ public class IndexModel : PageModel
     {
         LoadMessages();
         var message = Message.Trim();
+
+        if (message.Length == 0)
+        {
+            SaveMessages();
+            ModelState.Remove(nameof(Message));
+            return;
+        }
+
+        if (message.Length > TextNormalizer.MaxMessageLength)
+        {
+            Messages.Add(new("assistant", $"Sua pergunta é muito longa. Use no máximo {TextNormalizer.MaxMessageLength} caracteres."));
+            SaveMessages();
+            Message = string.Empty;
+            ModelState.Remove(nameof(Message));
+            return;
+        }
+
         Messages.Add(new("user", message));
 
-        if (message.Length > 0)
+        var context = BuildConversationContext();
+        var lookupQuestion = StudyChatbot.AddConversationContext(message, context) ?? message;
+        var reply = IsIncompleteQuestion(message)
+            ? await _chatbot.ReplyAsync(message, context)
+            : await FindApprovedAnswerAsync(lookupQuestion) ?? await _chatbot.ReplyAsync(message, context);
+        var interaction = new ChatInteraction
         {
-            var directIncompleteCheck = message.Length <= 45 &&
-                message.Contains("o que", StringComparison.OrdinalIgnoreCase) &&
-                message.Contains("funciona", StringComparison.OrdinalIgnoreCase) &&
-                Tokenize(message).Count == 0;
-            var reply = directIncompleteCheck
-                ? new ChatbotReply("Sobre qual assunto você quer saber? Por exemplo: machine learning, fotossíntese ou gravidade.", "esclarecimento", 1f)
-                : IsIncompleteQuestion(message)
-                    ? await _chatbot.ReplyAsync(message)
-                    : await FindApprovedAnswerAsync(message) ?? await _chatbot.ReplyAsync(message);
-            var interaction = new ChatInteraction
-            {
-                Question = message,
-                Answer = reply.Text,
-                Intent = reply.Intent,
-                Confidence = reply.Confidence,
-                SourcesJson = JsonSerializer.Serialize(reply.Sources ?? []),
-                CreatedAtUtc = DateTime.UtcNow
-            };
-            _db.Interactions.Add(interaction);
-            await _db.SaveChangesAsync();
+            Question = message,
+            Answer = reply.Text,
+            Intent = reply.Intent,
+            Confidence = reply.Confidence,
+            SourcesJson = JsonSerializer.Serialize(reply.Sources ?? []),
+            CreatedAtUtc = DateTime.UtcNow
+        };
+        _db.Interactions.Add(interaction);
+        await _db.SaveChangesAsync();
 
-            Messages.Add(new("assistant", reply.Text, reply.Intent, reply.Confidence, reply.Sources, interaction.Id));
-        }
+        Messages.Add(new("assistant", reply.Text, reply.Intent, reply.Confidence, reply.Sources, interaction.Id));
 
         SaveMessages();
         Message = string.Empty;
@@ -76,6 +87,12 @@ public class IndexModel : PageModel
 
     public async Task<IActionResult> OnPostFeedbackAsync(int id, bool correct)
     {
+        LoadMessages();
+        if (!Messages.Any(message => message.InteractionId == id))
+        {
+            return Forbid();
+        }
+
         var interaction = await _db.Interactions.FindAsync(id);
         if (interaction is null)
         {
@@ -83,7 +100,7 @@ public class IndexModel : PageModel
         }
 
         interaction.IsCorrect = correct;
-        interaction.ApprovedForTraining = correct;
+        interaction.ApprovedForTraining = correct && HasSources(interaction.SourcesJson);
         interaction.ReviewedAtUtc = DateTime.UtcNow;
         await _db.SaveChangesAsync();
         return RedirectToPage();
@@ -117,6 +134,11 @@ public class IndexModel : PageModel
 
     private void SaveMessages()
     {
+        if (Messages.Count > MaxSessionMessages)
+        {
+            Messages = Messages.TakeLast(MaxSessionMessages).ToList();
+        }
+
         HttpContext.Session.SetString(ChatSessionKey, JsonSerializer.Serialize(Messages));
     }
 
@@ -130,10 +152,18 @@ public class IndexModel : PageModel
 
         var approvedInteractions = await _db.Interactions
             .AsNoTracking()
-            .Where(interaction => interaction.ApprovedForTraining)
+            .Where(interaction => interaction.ApprovedForTraining && interaction.SourcesJson != "[]")
             .OrderByDescending(interaction => interaction.CreatedAtUtc)
             .Take(200)
             .ToListAsync();
+
+        var canonicalQuestion = TextNormalizer.CanonicalizeQuestion(question);
+        var exactMatch = approvedInteractions.FirstOrDefault(interaction =>
+            TextNormalizer.CanonicalizeQuestion(interaction.Question) == canonicalQuestion);
+        if (exactMatch is not null)
+        {
+            return ToApprovedReply(exactMatch);
+        }
 
         var bestMatch = approvedInteractions
             .Select(interaction => new
@@ -141,7 +171,7 @@ public class IndexModel : PageModel
                 Interaction = interaction,
                 Score = DiceSimilarity(questionTokens, Tokenize(interaction.Question))
             })
-            .Where(match => match.Score >= 0.55 &&
+            .Where(match => match.Score >= 0.82 &&
                 (!IsContentQuestion(question) || HasSources(match.Interaction.SourcesJson)))
             .OrderByDescending(match => match.Score)
             .FirstOrDefault();
@@ -151,27 +181,50 @@ public class IndexModel : PageModel
             return null;
         }
 
-        var sources = JsonSerializer.Deserialize<List<KnowledgeResult>>(bestMatch.Interaction.SourcesJson) ?? [];
+        return ToApprovedReply(bestMatch.Interaction);
+    }
+
+    private ConversationContext? BuildConversationContext()
+    {
+        for (var index = Messages.Count - 1; index >= 1; index--)
+        {
+            var assistant = Messages[index];
+            if (assistant.Role != "assistant" || assistant.Sources is not { Count: > 0 })
+            {
+                continue;
+            }
+
+            var previousUser = Messages
+                .Take(index)
+                .LastOrDefault(message => message.Role == "user");
+            var topic = assistant.Sources[0].Title;
+            return new ConversationContext(topic, previousUser?.Text, assistant.Text);
+        }
+
+        return null;
+    }
+
+    private static ChatbotReply ToApprovedReply(ChatInteraction interaction)
+    {
+        var sources = JsonSerializer.Deserialize<List<KnowledgeResult>>(interaction.SourcesJson) ?? [];
         return new ChatbotReply(
-            bestMatch.Interaction.Answer,
+            interaction.Answer,
             "resposta aprovada do banco",
-            1f,
+            0.99f,
             null,
             sources);
     }
 
     private static bool IsContentQuestion(string question)
     {
-        var normalized = RemoveAccents(question.ToLowerInvariant())
-            .Replace("oque", "o que");
+        var normalized = TextNormalizer.CanonicalizeQuestion(question);
         return new[] { "o que e", "explique", "quem foi", "como funciona", "qual a diferenca", "sobre " }
             .Any(marker => normalized.Contains(marker, StringComparison.Ordinal));
     }
 
     private static bool IsIncompleteQuestion(string question)
     {
-        var compact = new string(question
-            .ToLowerInvariant()
+        var compact = new string(TextNormalizer.Normalize(question)
             .Where(character => !char.IsWhiteSpace(character) && character != '?' && character != '!')
             .ToArray());
         return compact.Length <= 40 &&
@@ -193,7 +246,7 @@ public class IndexModel : PageModel
 
     private static HashSet<string> Tokenize(string text)
     {
-        var normalized = RemoveAccents(text.ToLowerInvariant()).Replace("oque", "o que");
+        var normalized = TextNormalizer.CanonicalizeQuestion(text);
         var tokens = normalized
             .Split([' ', '\t', '\r', '\n', '.', ',', '?', '!', ':', ';', '-', '/', '\\'], StringSplitOptions.RemoveEmptyEntries)
             .Where(token => token.Length > 1 && !StopWords.Contains(token));
@@ -220,8 +273,7 @@ public class IndexModel : PageModel
         }
 
         var score = 2d * overlap / (first.Count + second.Count);
-        var sharedTopic = first.Any(token => token.Length >= 6 && second.Any(candidate => AreSimilarTokens(token, candidate)));
-        return sharedTopic ? Math.Max(score, 0.6) : score;
+        return score;
     }
 
     private static bool AreSimilarTokens(string first, string second)
@@ -250,20 +302,6 @@ public class IndexModel : PageModel
         return previous[^1];
     }
 
-    private static string RemoveAccents(string value)
-    {
-        var decomposed = value.Normalize(NormalizationForm.FormD);
-        var builder = new StringBuilder();
-        foreach (var character in decomposed)
-        {
-            if (CharUnicodeInfo.GetUnicodeCategory(character) != UnicodeCategory.NonSpacingMark)
-            {
-                builder.Append(character);
-            }
-        }
-
-        return builder.ToString().Normalize(NormalizationForm.FormC);
-    }
 }
 
 public record ChatMessage(

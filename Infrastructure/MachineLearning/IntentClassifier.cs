@@ -6,6 +6,7 @@ namespace EstudaBot.Infrastructure.MachineLearning;
 public sealed class IntentClassifier
 {
     private readonly PredictionEngine<TrainingExample, IntentPrediction> _predictionEngine;
+    private readonly object _predictionLock = new();
 
     public IntentClassifier()
     {
@@ -29,8 +30,13 @@ public sealed class IntentClassifier
         _predictionEngine = mlContext.Model.CreatePredictionEngine<TrainingExample, IntentPrediction>(model);
     }
 
-    public IntentPrediction Predict(string message) =>
-        _predictionEngine.Predict(new TrainingExample { Text = message });
+    public IntentPrediction Predict(string message)
+    {
+        lock (_predictionLock)
+        {
+            return _predictionEngine.Predict(new TrainingExample { Text = message });
+        }
+    }
 
     public static IReadOnlyDictionary<string, string[]> Responses { get; } = new Dictionary<string, string[]>
     {

@@ -33,7 +33,10 @@ var app = builder.Build();
 
 using (var scope = app.Services.CreateScope())
 {
-    scope.ServiceProvider.GetRequiredService<ChatDbContext>().Database.EnsureCreated();
+    var database = scope.ServiceProvider.GetRequiredService<ChatDbContext>().Database;
+    database.EnsureCreated();
+    database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS IX_Interactions_CreatedAtUtc ON Interactions (CreatedAtUtc);");
+    database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS IX_Interactions_ApprovedForTraining_CreatedAtUtc ON Interactions (ApprovedForTraining, CreatedAtUtc);");
 }
 
 // Configure the HTTP request pipeline.

@@ -39,7 +39,7 @@
                                 }
                             </div>
                         }
-                        @if (message.InteractionId is not null)
+                        @if (message.InteractionId is not null && message.Sources is { Count: > 0 })
                         {
                             <form method="post" asp-page-handler="Feedback" class="feedback-form">
                                 <input type="hidden" name="id" value="@message.InteractionId" />
